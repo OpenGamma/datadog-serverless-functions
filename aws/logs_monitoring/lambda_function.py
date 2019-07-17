@@ -6,6 +6,8 @@
 from __future__ import print_function
 
 import base64
+from datetime import datetime
+import StringIO
 import gzip
 import json
 import os
@@ -24,21 +26,25 @@ try:
     # Datadog Lambda layer is required to forward metrics
     from datadog_lambda.wrapper import datadog_lambda_wrapper
     from datadog_lambda.metric import lambda_stats
+
     DD_FORWARD_METRIC = True
 except ImportError:
     # For backward-compatibility
     DD_FORWARD_METRIC = False
 
-
 # Set this variable to `False` to disable log forwarding.
 # E.g., when you only want to forward metrics from logs.
 DD_FORWARD_LOG = os.getenv("DD_FORWARD_LOG", default="true").lower() == "true"
-
 
 # Change this value to change the underlying network client (HTTP or TCP),
 # by default, use the TCP client.
 DD_USE_TCP = os.getenv("DD_USE_TCP", default="true").lower() == "true"
 
+# Set this variable to `False` to disable OpenGamma structured log forwarding.
+OG_STRUCTURED_LOGS = os.getenv("OG_STRUCTURED_LOGS", default="true").lower() == "true"
+
+# Set the bucket within which to store structured logs
+OG_STRUCTURED_LOG_BUCKET = os.getenv("OG_STRUCTURED_LOG_BUCKET")
 
 # Define the destination endpoint to send logs to
 DD_SITE = os.getenv("DD_SITE", default="datadoghq.com")
@@ -74,11 +80,12 @@ SCRUBBING_RULE_CONFIGS = [
         "xxxxx@xxxxx.com",
     ),
     ScrubbingRuleConfig(
-        "DD_SCRUBBING_RULE", 
-        os.getenv("DD_SCRUBBING_RULE", default=None), 
+        "DD_SCRUBBING_RULE",
+        os.getenv("DD_SCRUBBING_RULE", default=None),
         os.getenv("DD_SCRUBBING_RULE_REPLACEMENT", default="xxxxx")
     )
 ]
+
 
 # Use for include, exclude, and scrubbing rules
 def compileRegex(rule, pattern):
@@ -99,7 +106,6 @@ include_regex = compileRegex("INCLUDE_AT_MATCH", INCLUDE_AT_MATCH)
 
 EXCLUDE_AT_MATCH = os.getenv("EXCLUDE_AT_MATCH", default=None)
 exclude_regex = compileRegex("EXCLUDE_AT_MATCH", EXCLUDE_AT_MATCH)
-
 
 # DD_API_KEY: Datadog API Key
 DD_API_KEY = "<your_api_key>"
@@ -132,7 +138,6 @@ validation_res = requests.get(
 )
 if not validation_res.ok:
     raise Exception("The API key is not valid.")
-
 
 # DD_MULTILINE_LOG_REGEX_PATTERN: Datadog Multiline Log Regular Expression Pattern
 DD_MULTILINE_LOG_REGEX_PATTERN = None
@@ -327,8 +332,8 @@ class DatadogBatcher(object):
         for log in logs:
             log_size_bytes = self._sizeof_bytes(log)
             if size_count > 0 and (
-                size_count >= self._max_size_count
-                or size_bytes + log_size_bytes > self._max_size_bytes
+                    size_count >= self._max_size_count
+                    or size_bytes + log_size_bytes > self._max_size_bytes
             ):
                 batches.append(batch)
                 batch = []
@@ -357,7 +362,7 @@ class DatadogScrubber(object):
             if config.name in os.environ:
                 rules.append(
                     ScrubbingRule(
-                        compileRegex(config.name, config.pattern), 
+                        compileRegex(config.name, config.pattern),
                         config.placeholder
                     )
                 )
@@ -380,13 +385,47 @@ def datadog_forwarder(event, context):
         forward_logs(filter_logs(logs))
     if DD_FORWARD_METRIC:
         forward_metrics(metrics)
-
+    if OG_STRUCTURED_LOGS:
+        try:
+            forward_structured_logs(events)
+        except Exception as e:
+            print("Unexpected exception forwarding structured logs to S3: {}".format(str(e)))
 
 if DD_FORWARD_METRIC:
     # Datadog Lambda layer is required to forward metrics
     lambda_handler = datadog_lambda_wrapper(datadog_forwarder)
 else:
     lambda_handler = datadog_forwarder
+
+
+def forward_structured_logs(events):
+    """Forward structured logs to S3"""
+    results = ""
+    last_date = None
+    last_id = None
+    for log in events:
+        if log['service'] == "lambda" and "StructuredLogEvent: " in log['message']:
+            date_time = datetime.utcfromtimestamp(log['timestamp'] / 1000)
+            formatted_date = date_time.strftime('%Y-%m-%d %H:%M:%S')
+            structured_event = json.loads(log['message'].split("StructuredLogEvent: ")[1])
+            last_date = date_time
+            last_id = log['id']
+            structured_event['timestamp'] = formatted_date
+            structured_event['id'] = log['id']
+            results = results + json.dumps(structured_event) + "\n"
+
+    if not last_date is None:
+        s3_key = "structuredevents/flatfiles/year={}/month={}/day={}/{}.json.gz" \
+            .format(last_date.year, '%02d' % last_date.month, '%02d' % last_date.day, last_id)
+        upload_to_s3(results, s3_key)
+
+
+def upload_to_s3(object, key):
+    s3 = boto3.client('s3')
+    out = StringIO.StringIO()
+    with gzip.GzipFile(fileobj=out, mode="w") as f:
+        f.write(object)
+    s3.put_object(Body=out.getvalue(), Bucket=OG_STRUCTURED_LOG_BUCKET, Key=key)
 
 
 def forward_logs(logs):
@@ -494,8 +533,8 @@ def filter_logs(logs):
     """
     if INCLUDE_AT_MATCH is None and EXCLUDE_AT_MATCH is None:
         # convert to strings
-        return logs 
-    # Add logs that should be sent to logs_to_send
+        return logs
+        # Add logs that should be sent to logs_to_send
     logs_to_send = []
     # Test each log for exclusion and inclusion, if the criteria exist
     for log in logs:
@@ -627,15 +666,16 @@ def kinesis_awslogs_handler(event, context, metadata):
                 "data": record["kinesis"]["data"]
             }
         }
-        
-    return itertools.chain.from_iterable(awslogs_handler(reformat_record(r), context, metadata) for r in event["Records"])
+
+    return itertools.chain.from_iterable(
+        awslogs_handler(reformat_record(r), context, metadata) for r in event["Records"])
 
 
 # Handle CloudWatch logs
 def awslogs_handler(event, context, metadata):
     # Get logs
     with gzip.GzipFile(
-        fileobj=BytesIO(base64.b64decode(event["awslogs"]["data"]))
+            fileobj=BytesIO(base64.b64decode(event["awslogs"]["data"]))
     ) as decompress_stream:
         # Reading line by line avoid a bug where gzip would take a very long
         # time (>5min) for file around 60MB gzipped
@@ -705,7 +745,6 @@ def awslogs_handler(event, context, metadata):
 
 # Handle Cloudwatch Events
 def cwevent_handler(event, metadata):
-
     data = event
 
     # Set the source on the log
@@ -723,7 +762,6 @@ def cwevent_handler(event, metadata):
 
 # Handle Sns events
 def sns_handler(event, metadata):
-
     data = event
     # Set the source on the log
     metadata[DD_SOURCE] = parse_event_source(event, "sns")
@@ -812,7 +850,7 @@ def parse_service_arn(source, key, bucket, context):
             keysplit = "/".join(idsplit).split("_")
         # If no prefix, split the key
         else:
-            keysplit = key.split("_")        
+            keysplit = key.split("_")
         if len(keysplit) > 3:
             region = keysplit[2].lower()
             name = keysplit[3]
